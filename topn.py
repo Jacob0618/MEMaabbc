@@ -2,21 +2,17 @@ import os
 import torch
 import random
 import argparse
-from transformers import T5Tokenizer
+from transformers import AutoTokenizer
 from utils import SeqDataLoader, TopNBatchify, now_time, evaluate_ndcg, evaluate_hr
-import torch.serialization as serialization
-from module import Solomon   # 你自己的模型类
-
-# 告诉 PyTorch：加载 checkpoint 时，Solomon 这个类是安全的
-serialization.add_safe_globals([Solomon])
+from module import Solomon
 
 
 parser = argparse.ArgumentParser(description='POD (PrOmpt Distillation) — TopN evaluation')
 parser.add_argument('--data_dir', type=str, default=None,
                     help='directory for loading the data')
-parser.add_argument('--model_version', type=int, default=0,
-                    help='1: t5-base; 2: t5-large; 3: t5-3b; 4: t5-11b; otherwise: t5-small')
-parser.add_argument('--batch_size', type=int, default=32,
+parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-7B',
+                    help='HuggingFace model name (must match the one used in pretrain.py)')
+parser.add_argument('--batch_size', type=int, default=8,
                     help='batch size')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
@@ -30,18 +26,9 @@ parser.add_argument('--top_n', type=int, default=10,
                     help='number of items to predict')
 parser.add_argument('--max_history_len', type=int, default=10,
                     help='max number of recent interaction items included as context')
+parser.add_argument('--max_new_tokens', type=int, default=30,
+                    help='max tokens to generate per candidate (item IDs are short)')
 args = parser.parse_args()
-
-if args.model_version == 1:
-    model_version = 't5-base'
-elif args.model_version == 2:
-    model_version = 't5-large'
-elif args.model_version == 3:
-    model_version = 't5-3b'
-elif args.model_version == 4:
-    model_version = 't5-11b'
-else:
-    model_version = 't5-small'
 
 print('-' * 40 + 'ARGUMENTS' + '-' * 40)
 for arg in vars(args):
@@ -64,7 +51,11 @@ model_path = os.path.join(args.checkpoint, 'model.pt')
 TOPN_TASK_ID = 0
 
 print(now_time() + 'Loading data')
-tokenizer = T5Tokenizer.from_pretrained(model_version)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'right'
+
 seq_corpus = SeqDataLoader(args.data_dir)
 nitem = len(seq_corpus.id2item)
 topn_iterator = TopNBatchify(
@@ -79,7 +70,6 @@ topn_iterator = TopNBatchify(
 
 
 def generate():
-    # Turn on evaluation mode which disables dropout.
     model.eval()
     idss_predict = []
     with torch.no_grad():
@@ -97,10 +87,12 @@ def generate():
                 whole_word_ids=whole_word,
                 attention_mask=source_mask,
                 recency_ids=recency,
+                max_length=args.max_new_tokens,
                 num_beams=args.num_beams,
                 num_return_sequences=args.top_n,
             )
 
+            # beam_outputs: (batch_size * top_n, seq_len)
             output_tensor = beam_outputs.view(task.size(0), args.top_n, -1)
             for i in range(task.size(0)):
                 results = tokenizer.batch_decode(output_tensor[i], skip_special_tokens=True)
@@ -112,10 +104,10 @@ def generate():
 
 
 # Load the best saved model.
+print(now_time() + 'Loading checkpoint from {}'.format(model_path))
 with open(model_path, 'rb') as f:
     model = torch.load(f, map_location=device, weights_only=False)
 model.to(device)
-
 
 # Run on test data.
 print(now_time() + 'Generating recommendations')
@@ -130,8 +122,8 @@ for predictions, user in zip(idss_predicted, topn_iterator.user_list):
     for p in predictions:
         try:
             prediction_list.append(int(p.split(' ')[0]))
-        except:
-            prediction_list.append(random.randint(1, nitem))  # randomly generate a recommendation
+        except Exception:
+            prediction_list.append(random.randint(1, nitem))
     user2rank_list[user] = prediction_list
 
 top_ns = [1]

@@ -1,28 +1,29 @@
 import os
 import torch
 import argparse
-import torch.nn as nn
-from transformers import T5Tokenizer
+from transformers import AutoTokenizer
 from module import Solomon
 from utils import SeqDataLoader, TrainBatchify, TopNBatchify, now_time
 from templates import topn_templates, topn_templates_no_history
 from peft import get_peft_model, LoraConfig, TaskType
 
 
-parser = argparse.ArgumentParser(description='POD (PrOmpt Distillation) — TopN-focused')
+parser = argparse.ArgumentParser(description='POD (PrOmpt Distillation) — TopN with Qwen')
 parser.add_argument('--data_dir', type=str, default=None,
                     help='directory for loading the data')
-parser.add_argument('--model_version', type=int, default=0,
-                    help='1: t5-base; 2: t5-large; 3: t5-3b; 4: t5-11b; otherwise: t5-small')
+parser.add_argument('--model_name', type=str, default='Qwen/Qwen3-7B',
+                    help='HuggingFace model name or local path. '
+                         'Qwen3 dense sizes: 0.6B/1.7B/4B/8B/14B/32B. '
+                         'For 7B use Qwen/Qwen2.5-7B if Qwen3-7B is unavailable.')
 parser.add_argument('--task_num', type=int, default=1,
                     help='task number (currently only topN)')
 parser.add_argument('--prompt_num', type=int, default=100,
                     help='number of continuous prompt vectors per task')
-parser.add_argument('--lr', type=float, default=0.001,
+parser.add_argument('--lr', type=float, default=1e-3,
                     help='learning rate')
 parser.add_argument('--epochs', type=int, default=100,
                     help='upper epoch limit')
-parser.add_argument('--batch_size', type=int, default=64,
+parser.add_argument('--batch_size', type=int, default=16,
                     help='batch size')
 parser.add_argument('--cuda', action='store_true',
                     help='use CUDA')
@@ -37,21 +38,10 @@ parser.add_argument('--negative_num', type=int, default=99,
 parser.add_argument('--max_history_len', type=int, default=10,
                     help='max number of recent interaction items included as context')
 parser.add_argument('--finetune_lm', action='store_true',
-                    help='if set, fine-tune the LM backbone via LoRA; otherwise only train prompt')
+                    help='fine-tune LM backbone via LoRA; otherwise only train prompt')
 parser.add_argument('--lora_r', type=int, default=16,
                     help='LoRA rank (only used when --finetune_lm is set)')
 args = parser.parse_args()
-
-if args.model_version == 1:
-    model_version = 't5-base'
-elif args.model_version == 2:
-    model_version = 't5-large'
-elif args.model_version == 3:
-    model_version = 't5-3b'
-elif args.model_version == 4:
-    model_version = 't5-11b'
-else:
-    model_version = 't5-small'
 
 print('-' * 40 + 'ARGUMENTS' + '-' * 40)
 for arg in vars(args):
@@ -72,11 +62,15 @@ model_path = os.path.join(args.checkpoint, 'model.pt')
 ###############################################################################
 
 print(now_time() + 'Loading data')
-tokenizer = T5Tokenizer.from_pretrained(model_version)
+tokenizer = AutoTokenizer.from_pretrained(args.model_name, trust_remote_code=True)
+# Qwen 系列的 pad_token 默认等于 eos_token，右 padding 对训练更友好
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'right'
+
 seq_corpus = SeqDataLoader(args.data_dir)
 nitem = len(seq_corpus.id2item)
 
-# topN task_id = 0 (唯一任务)
 TOPN_TASK_ID = 0
 
 all_iterator = TrainBatchify(
@@ -94,7 +88,9 @@ topn_iterator = TopNBatchify(
 # Build the model
 ###############################################################################
 
-model = Solomon.from_pretrained(model_version)
+print(now_time() + 'Loading model: {}'.format(args.model_name))
+model = Solomon.from_pretrained(args.model_name, torch_dtype=torch.float16,
+                                trust_remote_code=True)
 
 # 用 topN 模板的 token embedding 初始化 prompt 向量
 template_texts = [t.format(0, '0', '0') for t in topn_templates] + \
@@ -104,23 +100,27 @@ model.init_prompt(args.task_num, args.prompt_num, device,
 model.to(device)
 
 if args.finetune_lm:
+    # Qwen3/Qwen2.5 的注意力 + FFN 投影层名称
     peft_config = LoraConfig(
-        task_type=TaskType.SEQ_2_SEQ_LM,
+        task_type=TaskType.CAUSAL_LM,
         inference_mode=False,
         r=args.lora_r,
         lora_alpha=32,
-        lora_dropout=0.1,
-        target_modules=["q", "v", "o", "wi", "wo"],
-        modules_to_save=["prompt_embeddings", "whole_word_embeddings"],
+        lora_dropout=0.05,
+        target_modules=[
+            'q_proj', 'k_proj', 'v_proj', 'o_proj',
+            'gate_proj', 'up_proj', 'down_proj',
+        ],
+        modules_to_save=['prompt_embeddings', 'whole_word_embeddings'],
     )
     model = get_peft_model(model, peft_config)
-    # recency_alpha 不在 modules_to_save 中，需手动开启梯度
+    # recency_alpha 不在 modules_to_save 中，手动保留梯度
     for name, param in model.named_parameters():
         if 'recency_alpha' in name:
             param.requires_grad = True
     model.print_trainable_parameters()
 else:
-    # 冻结语言模型主干，只训练 prompt 相关参数
+    # 冻结 LM 主干，只训练三个轻量组件
     for param in model.parameters():
         param.requires_grad = False
     for param in model.prompt_embeddings.parameters():
@@ -130,7 +130,8 @@ else:
     model.recency_alpha.requires_grad = True
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total = sum(p.numel() for p in model.parameters())
-    print(f'trainable params: {trainable} || all params: {total} || trainable%: {100 * trainable / total:.4f}')
+    print('trainable params: {:,} || all params: {:,} || trainable%: {:.4f}'.format(
+        trainable, total, 100 * trainable / total))
 
 optimizer = torch.optim.AdamW(
     filter(lambda p: p.requires_grad, model.parameters()), lr=args.lr
@@ -171,7 +172,8 @@ def train():
         text_loss += batch_size * loss.item()
         total_sample += batch_size
 
-        if all_iterator.batch_index % args.log_interval == 0 or all_iterator.batch_index % all_iterator.batch_num == 0:
+        if all_iterator.batch_index % args.log_interval == 0 or \
+                all_iterator.batch_index % all_iterator.batch_num == 0:
             cur_t_loss = text_loss / total_sample
             print(now_time() + 'topN loss {:4.4f} | {:5d}/{:5d} batches'.format(
                 cur_t_loss, all_iterator.batch_index, all_iterator.batch_num))

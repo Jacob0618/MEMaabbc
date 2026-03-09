@@ -1,107 +1,140 @@
-from transformers import T5ForConditionalGeneration
-from transformers.modeling_outputs import BaseModelOutput
+"""
+Solomon: 以 Qwen（decoder-only causal LM）为骨干的 Prompt Distillation 推荐模型。
 
-# 4.36.2 里这些东西被拆到了 generation 子模块
-from transformers.generation.logits_process import (
-    LogitsProcessorList,
-    MinLengthLogitsProcessor,
-    NoBadWordsLogitsProcessor,
-    HammingDiversityLogitsProcessor,
-    RepetitionPenaltyLogitsProcessor,
-)
-from transformers.generation import BeamSearchScorer
-from transformers.generation.stopping_criteria import (
-    MaxLengthCriteria,
-    StoppingCriteriaList,
-)
+训练时的序列结构：
+  [soft_prompts | input_tokens | target_tokens]
+   ← -100 masked → ← -100 masked → ← loss here →
 
-import torch.nn as nn
+推理时只给模型前两段，由 generate() 续写目标。
+"""
 import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM
+
+# whole_word_embeddings 的最大序列长度（推荐序列远不会超过此值）
+_MAX_SEQ_LEN = 2048
 
 
-class Solomon(T5ForConditionalGeneration):
-    def __init__(self, config):
-        super().__init__(config)
+class Solomon(nn.Module):
 
-    def init_prompt(self, task_num, prompts_per_task, device, tokenizer=None, template_texts=None):
-        emsize = self.shared.weight.size(1)
+    def __init__(self):
+        super().__init__()
+        # 占位，由 from_pretrained 填充
+        self.lm = None
+        self.config = None
+
+    # ------------------------------------------------------------------
+    # 构造 / 反序列化
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def from_pretrained(cls, model_name_or_path, torch_dtype=torch.float16, **kwargs):
+        """加载 Qwen（或任意 causal LM）并返回 Solomon 实例。"""
+        obj = cls()
+        obj.lm = AutoModelForCausalLM.from_pretrained(
+            model_name_or_path,
+            torch_dtype=torch_dtype,
+            **kwargs,
+        )
+        obj.config = obj.lm.config
+        return obj
+
+    # ------------------------------------------------------------------
+    # Prompt 初始化
+    # ------------------------------------------------------------------
+
+    def init_prompt(self, task_num, prompts_per_task, device,
+                    tokenizer=None, template_texts=None):
+        emsize = self.lm.get_input_embeddings().weight.size(1)
         self.prompts_per_task = prompts_per_task
         self.model_device = device
-        self.prompt_embeddings = nn.Embedding(task_num * prompts_per_task, emsize)
-        self.whole_word_embeddings = nn.Embedding(self.config.n_positions, emsize)
 
-        # 可学习的近因衰减参数，softplus 后作为指数衰减的强度
+        self.prompt_embeddings = nn.Embedding(task_num * prompts_per_task, emsize)
+        self.whole_word_embeddings = nn.Embedding(_MAX_SEQ_LEN, emsize)
         self.recency_alpha = nn.Parameter(torch.tensor(1.0))
+
+        # pad token id（用于在 forward 时区分有效 target 和 padding）
+        pad_id = None
+        if tokenizer is not None:
+            pad_id = getattr(tokenizer, 'pad_token_id', None)
+        if pad_id is None:
+            pad_id = getattr(self.config, 'pad_token_id', None)
+        if pad_id is None:
+            pad_id = getattr(self.config, 'eos_token_id', 0)
+        self.pad_token_id = pad_id
 
         if tokenizer is not None and template_texts is not None:
             self._init_prompt_from_templates(tokenizer, template_texts)
         else:
-            initrange = 0.1
-            self.prompt_embeddings.weight.data.uniform_(-initrange, initrange)
+            self.prompt_embeddings.weight.data.uniform_(-0.1, 0.1)
 
-        self.prompt_offset = torch.arange(prompts_per_task).to(self.model_device)
+        self.prompt_offset = torch.arange(prompts_per_task).to(device)
 
     def _init_prompt_from_templates(self, tokenizer, template_texts):
-        """用离散 prompt 模板的 token embedding 均值来初始化连续 prompt 向量。"""
+        """用离散模板的 token embedding 均值初始化 prompt 向量。"""
         all_token_ids = []
         for text in template_texts:
             ids = tokenizer.encode(text, add_special_tokens=False)
             all_token_ids.extend(ids)
-        all_token_ids = torch.tensor(all_token_ids, dtype=torch.long).to(self.shared.weight.device)
+
+        embed_weight = self.lm.get_input_embeddings().weight
+        all_token_ids = torch.tensor(all_token_ids, dtype=torch.long,
+                                     device=embed_weight.device)
         with torch.no_grad():
-            template_embs = self.shared(all_token_ids)  # (num_tokens, emsize)
-            total_prompts = self.prompt_embeddings.weight.size(0)
-            num_tokens = template_embs.size(0)
-            if num_tokens >= total_prompts:
-                init_embs = template_embs[:total_prompts]
+            template_embs = embed_weight[all_token_ids]          # (T, emsize)
+            total = self.prompt_embeddings.weight.size(0)
+            T = template_embs.size(0)
+            if T >= total:
+                init_embs = template_embs[:total]
             else:
-                repeats = (total_prompts // num_tokens) + 1
-                init_embs = template_embs.repeat(repeats, 1)[:total_prompts]
+                repeats = (total // T) + 1
+                init_embs = template_embs.repeat(repeats, 1)[:total]
             self.prompt_embeddings.weight.data.copy_(init_embs)
-            self.prompt_embeddings.weight.data += torch.randn_like(
-                self.prompt_embeddings.weight.data
-            ) * 0.01
+            # 加微小噪声打破对称性
+            self.prompt_embeddings.weight.data += \
+                torch.randn_like(self.prompt_embeddings.weight.data) * 0.01
+
+    # ------------------------------------------------------------------
+    # 近因加权
+    # ------------------------------------------------------------------
 
     def apply_recency_weight(self, embeddings, recency_ids):
-        """对历史交互物品的 embedding 施加平滑指数近因加权。
-
-        recency_ids: (batch_size, seq_len)
-            0  — 非历史物品 token（模板词、用户 ID、候选物品）
-            1..K — 历史物品，1 = 最旧，K = 最新
-        最新的物品获得接近 1.0 的权重，较旧的物品权重以 exp 衰减。
-        """
+        """对历史物品 token 施加指数近因加权（最新物品 ≈ 1.0，越旧越小）。"""
         if recency_ids is None:
             return embeddings
         max_pos = recency_ids.max(dim=1, keepdim=True)[0].float().clamp(min=1)
-        normalized = recency_ids.float() / max_pos  # 0~1, 1 = 最新
+        normalized = recency_ids.float() / max_pos          # 0~1，1=最新
         alpha = torch.nn.functional.softplus(self.recency_alpha)
         weight = torch.exp(-alpha * (1.0 - normalized))
         mask = (recency_ids > 0).float()
-        final_weight = mask * weight + (1.0 - mask)
+        final_weight = mask * weight + (1.0 - mask)         # 非历史 token 权重=1
         return embeddings * final_weight.unsqueeze(-1)
 
+    # ------------------------------------------------------------------
+    # Embedding 辅助
+    # ------------------------------------------------------------------
+
     def input_plus_whole_word(self, input_ids, whole_word_ids, recency_ids=None):
-        text_emb = self.shared(input_ids)  # (batch_size, src_len, emsize)
+        text_emb = self.lm.get_input_embeddings()(input_ids)
         whole_word_emb = self.whole_word_embeddings(whole_word_ids)
         text_emb_plus = text_emb + whole_word_emb
         text_emb_plus = self.apply_recency_weight(text_emb_plus, recency_ids)
         return text_emb_plus
 
-    def append_prompt(self, task_id, input_ids, whole_word_ids, attention_mask, recency_ids=None):
-        # prompt
+    def append_prompt(self, task_id, text_emb, attention_mask):
         batch_size = task_id.size(0)
-        task_ids = (task_id * self.prompts_per_task).unsqueeze(1) + self.prompt_offset.repeat(batch_size, 1)  # (batch_size, prompts_per_task)
-        prompt = self.prompt_embeddings(task_ids)  # (batch_size, prompts_per_task, input_size)
-
-        # text
-        text_emb_plus = self.input_plus_whole_word(input_ids, whole_word_ids, recency_ids)
-        input_emb = torch.cat([prompt, text_emb_plus], 1)  # (batch_size, src_total_len, emsize)
-
-        # mask
-        prompt_pad = torch.ones((batch_size, self.prompts_per_task), dtype=torch.int64).to(self.model_device)
-        input_mask = torch.cat([prompt_pad, attention_mask], 1)  # (batch_size, src_total_len)
-
+        task_ids = (task_id * self.prompts_per_task).unsqueeze(1) + \
+                   self.prompt_offset.repeat(batch_size, 1)        # (B, K)
+        prompt = self.prompt_embeddings(task_ids)                   # (B, K, emsize)
+        input_emb = torch.cat([prompt, text_emb], dim=1)
+        prompt_mask = torch.ones(batch_size, self.prompts_per_task,
+                                 dtype=torch.int64, device=self.model_device)
+        input_mask = torch.cat([prompt_mask, attention_mask], dim=1)
         return input_emb, input_mask
+
+    # ------------------------------------------------------------------
+    # Forward（训练 / 验证）
+    # ------------------------------------------------------------------
 
     def forward(
         self,
@@ -110,61 +143,57 @@ class Solomon(T5ForConditionalGeneration):
         whole_word_ids=None,
         attention_mask=None,
         recency_ids=None,
-        decoder_input_ids=None,
-        decoder_attention_mask=None,
-        head_mask=None,
-        decoder_head_mask=None,
-        cross_attn_head_mask=None,
-        encoder_outputs=None,
-        past_key_values=None,
-        inputs_embeds=None,
-        decoder_inputs_embeds=None,
         labels=None,
-        use_cache=None,
-        output_attentions=None,
-        output_hidden_states=None,
-        return_dict=None,
+        **kwargs,
     ):
-        if encoder_outputs is None:
-            if task_id is None:
-                input_emb = self.input_plus_whole_word(input_ids, whole_word_ids, recency_ids)
-            else:
-                input_emb, attention_mask = self.append_prompt(task_id, input_ids, whole_word_ids, attention_mask, recency_ids)
-            # Convert encoder inputs in embeddings if needed
-            encoder_outputs = self.encoder(
-                #input_ids=input_ids,
-                attention_mask=attention_mask,
-                inputs_embeds=input_emb,
-                head_mask=head_mask,
-                output_attentions=output_attentions,
-                output_hidden_states=output_hidden_states,
-                return_dict=return_dict,
-            )
-        elif return_dict and not isinstance(encoder_outputs, BaseModelOutput):
-            encoder_outputs = BaseModelOutput(
-                last_hidden_state=encoder_outputs[0],
-                hidden_states=encoder_outputs[1] if len(encoder_outputs) > 1 else None,
-                attentions=encoder_outputs[2] if len(encoder_outputs) > 2 else None,
-            )
+        """
+        labels: (B, tgt_len)  — target token ids（T5/Qwen tokenizer 产生），
+                padding 位置为 pad_token_id 或 0。
+        """
+        # 1. 构建输入 embedding（含 whole_word 与 recency 加权）
+        text_emb = self.input_plus_whole_word(input_ids, whole_word_ids, recency_ids)
 
-        return super().forward(
-            #input_ids=input_ids,
-            #attention_mask=attention_mask,
-            decoder_input_ids=decoder_input_ids,
-            decoder_attention_mask=decoder_attention_mask,
-            head_mask=head_mask,
-            decoder_head_mask=decoder_head_mask,
-            cross_attn_head_mask=cross_attn_head_mask,
-            encoder_outputs=encoder_outputs,
-            past_key_values=past_key_values,
-            #inputs_embeds=inputs_embeds,
-            decoder_inputs_embeds=decoder_inputs_embeds,
-            labels=labels,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
-            output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-        )
+        # 2. 拼接软 prompt
+        if task_id is not None:
+            text_emb, attention_mask = self.append_prompt(task_id, text_emb, attention_mask)
+
+        src_len = text_emb.size(1)
+        batch_size = text_emb.size(0)
+        dev = input_ids.device
+
+        if labels is not None:
+            # --- 训练 / 验证 ---
+            # 处理 labels padding：pad_token_id 和 0 都视为无效 token
+            pad_mask = (labels == self.pad_token_id) | (labels == 0)
+            safe_labels = labels.clone()
+            safe_labels[pad_mask] = 0
+
+            # target embedding
+            tgt_emb = self.lm.get_input_embeddings()(safe_labels)   # (B, tgt_len, emsize)
+            tgt_mask = (~pad_mask).long()                             # (B, tgt_len)
+
+            # 完整序列 = [prompt + input | target]
+            all_emb = torch.cat([text_emb, tgt_emb], dim=1)
+            all_mask = torch.cat([attention_mask, tgt_mask], dim=1)
+
+            # loss 只算 target 位置
+            lm_labels = torch.cat([
+                torch.full((batch_size, src_len), -100, dtype=torch.long, device=dev),
+                labels.masked_fill(pad_mask, -100),
+            ], dim=1)
+
+            return self.lm(
+                inputs_embeds=all_emb,
+                attention_mask=all_mask,
+                labels=lm_labels,
+            )
+        else:
+            # --- 推理（不需要 target）---
+            return self.lm(inputs_embeds=text_emb, attention_mask=attention_mask)
+
+    # ------------------------------------------------------------------
+    # Beam Search（推理）
+    # ------------------------------------------------------------------
 
     def my_beam_search(
         self,
@@ -173,7 +202,7 @@ class Solomon(T5ForConditionalGeneration):
         whole_word_ids=None,
         attention_mask=None,
         recency_ids=None,
-        max_length=50,
+        max_length=30,
         num_beams=20,
         num_beam_groups=1,
         early_stopping=True,
@@ -183,69 +212,38 @@ class Solomon(T5ForConditionalGeneration):
         num_return_sequences=20,
         bad_words_ids=None,
     ):
-        # define decoder start token ids
-        batch_size = input_ids.size(0)
-        decoder_input_ids = torch.ones((num_beams * batch_size, 1), dtype=torch.int64).to(self.model_device)
-        decoder_input_ids = decoder_input_ids * self.config.decoder_start_token_id
+        text_emb = self.input_plus_whole_word(input_ids, whole_word_ids, recency_ids)
+        if task_id is not None:
+            text_emb, attention_mask = self.append_prompt(task_id, text_emb, attention_mask)
 
-        # add encoder_outputs to model keyword arguments
-        if task_id is None:
-            input_emb = self.input_plus_whole_word(input_ids, whole_word_ids, recency_ids)
-        else:
-            input_emb, attention_mask = self.append_prompt(task_id, input_ids, whole_word_ids, attention_mask, recency_ids)
-        model_kwargs = {
-            "encoder_outputs": self.encoder(
-                attention_mask=attention_mask.repeat_interleave(num_beams, dim=0),
-                inputs_embeds=input_emb.repeat_interleave(num_beams, dim=0),
-                return_dict=True,
-            )
-        }
-
-        # instantiate beam scorer
-        beam_scorer = BeamSearchScorer(
-            batch_size=batch_size,
+        gen_kwargs = dict(
+            inputs_embeds=text_emb,
+            attention_mask=attention_mask,
+            max_new_tokens=max_length,
             num_beams=num_beams,
-            device=self.model_device,
-            num_beam_groups=num_beam_groups,
-            num_beam_hyps_to_keep=num_return_sequences,
-            do_early_stopping=early_stopping,
+            num_return_sequences=num_return_sequences,
+            early_stopping=early_stopping,
         )
-
-        criteria = StoppingCriteriaList()
-        criteria.append(MaxLengthCriteria(max_length=max_length))
-
-        # instantiate logits processors
-        logits_processor = LogitsProcessorList()
-        logits_processor.append(MinLengthLogitsProcessor(min_length, eos_token_id=self.config.eos_token_id))
+        if min_length > 1:
+            gen_kwargs['min_new_tokens'] = min_length
+        if num_beam_groups > 1 and diversity_penalty > 0.0:
+            gen_kwargs['num_beam_groups'] = num_beam_groups
+            gen_kwargs['diversity_penalty'] = diversity_penalty
+        if repetition_penalty != 1.0:
+            gen_kwargs['repetition_penalty'] = repetition_penalty
         if bad_words_ids is not None:
-            logits_processor.append(NoBadWordsLogitsProcessor(bad_words_ids, eos_token_id=self.config.eos_token_id))
+            gen_kwargs['bad_words_ids'] = bad_words_ids
 
-        if num_beam_groups == 1:
-            return super().beam_search(
-                decoder_input_ids,
-                beam_scorer,
-                stopping_criteria=criteria,
-                logits_processor=logits_processor,
-                **model_kwargs)
-        else:
-            if diversity_penalty > 0.0:
-                logits_processor.append(
-                    HammingDiversityLogitsProcessor(
-                        diversity_penalty,
-                        num_beams=num_beams,
-                        num_beam_groups=num_beam_groups,
-                    )
-                )
-            if repetition_penalty != 1.0:
-                logits_processor.append(
-                    RepetitionPenaltyLogitsProcessor(
-                        penalty=repetition_penalty,
-                    )
-                )
+        return self.lm.generate(**gen_kwargs)
 
-            return super().group_beam_search(
-                decoder_input_ids,
-                beam_scorer,
-                stopping_criteria=criteria,
-                logits_processor=logits_processor,
-                **model_kwargs)
+    # ------------------------------------------------------------------
+    # 保证 model_device / prompt_offset 随 .to() 一起迁移
+    # ------------------------------------------------------------------
+
+    def to(self, device_or_dtype=None, *args, **kwargs):
+        result = super().to(device_or_dtype, *args, **kwargs)
+        if isinstance(device_or_dtype, (str, torch.device)):
+            self.model_device = torch.device(device_or_dtype)
+            if hasattr(self, 'prompt_offset'):
+                self.prompt_offset = self.prompt_offset.to(self.model_device)
+        return result
